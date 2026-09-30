@@ -138,6 +138,19 @@ Exit 127 there means the remote could not find that "command name" — an assemb
 mistake, not a channel fault. Quoting is deliberate: it is what blocks shell
 injection through arguments.
 
+**`-f` runs the shipped file with `bash`, whatever its own shebang says.** The
+payload is copied to a remote temp path and executed as `bash "$T" <args>` (see
+`wrap_exec_file_script`); the exit code passes through and the temp file is
+removed either way. So a `.py` payload is read line by line as shell — remote
+stderr fills with `import: command not found` and nothing gets written. Ship a
+bash wrapper when the payload is another language:
+
+```bash
+rsh worker-a -f ./run.sh -- a b     # ✅ run.sh is bash; it can embed a heredoc:
+                                    #    python3 - "$@" <<'PYEOF' … PYEOF
+rsh worker-a -f ./tool.py -- a b    # ❌ executed by bash, not by python
+```
+
 **Every route runs with the same cwd**: the rshd route inherits the worker's
 startup directory, the ssh routes prefix `cd <RSH_REMOTE_WS> && `, so callers can
 use workspace-relative paths on either route.
