@@ -1,10 +1,6 @@
 # rsh — reverse command channel
 
-Solves the operational dead end of "the hub cannot dial machines behind
-NAT/firewall": instead of the hub connecting to the workers, **each worker
-dials out to the hub and keeps the connection open**, and the hub pushes
-commands down that established channel. A machine that only ever makes outbound
-connections is fully manageable.
+Workers behind NAT/firewalls dial the hub and keep an outbound connection open. The hub sends commands and forwards connections over it.
 
 Three pieces, all Python 3 stdlib only:
 
@@ -49,7 +45,7 @@ directory (all defaults are derived from the file locations and `RSH_WS`).
 ## Configuration
 
 One KEY=VALUE file (`export ` prefix and quoting tolerated, `#` comments), read
-at startup; **the process environment always wins over the file**, which makes
+at startup; the process environment always wins over the file, which makes
 per-invocation overrides and tests easy. A value carrying the `enc1:` prefix is
 decrypted in memory through the decryptor (contract below), so the file can be
 committed without plaintext secrets.
@@ -67,7 +63,7 @@ in the environment instead).
 | `RSH_HOST_ID` | `<hostname> <canonical name>` table used for the worker name | `<ws>/env/host-id` |
 | `RSH_REMOTE_WS` | cwd prefix the ssh routes send to the remote shell | `~/m` |
 | `RSH_TOKEN` | the shared secret (hub + every worker) | — (required) |
-| `RSH_HUB` | hub address **as the worker resolves it** (worker) / ssh target for CLI nesting (CLI) | — (required on workers) |
+| `RSH_HUB` | hub address as the worker resolves it (worker) / ssh target for CLI nesting (CLI) | — (required on workers) |
 | `RSH_PORT` | TCP port | `8790` |
 | `RSH_BIND` | hub listen address | `0.0.0.0` |
 | `RSH_SOCK` | hub control socket | `<ws>/run/rsh/rshd.sock` |
@@ -120,13 +116,6 @@ rsh worker-a -- bash -lc 'uptime && whoami'   # composite command: wrap it yours
 rsh worker-a -f ./script.sh -- a b      # ship a script, args become $1..
 ```
 
-There are **no subcommands**: the mode follows from the flags (`rsh list` /
-`rsh exec` are usage errors, exit 2), and the command must come after `--`.
-
-**Argv semantics — the one real gotcha.** The words after `--` are handed over
-as argv, each `shlex.quote`d and joined into a single string that a shell then
-runs. Word boundaries survive and shell metacharacters are inert, so a
-composite command must be written as one shell string yourself:
 
 ```bash
 rsh worker-a -- bash -lc 'hostname && uptime -s'   # ✅ wrapped in a shell
@@ -134,16 +123,6 @@ rsh worker-a -- 'hostname && uptime -s'            # ❌ one single command *nam
 #   remote stderr: bash: line 1: hostname && uptime -s: command not found
 ```
 
-Exit 127 there means the remote could not find that "command name" — an assembly
-mistake, not a channel fault. Quoting is deliberate: it is what blocks shell
-injection through arguments.
-
-**`-f` runs the shipped file with `bash`, whatever its own shebang says.** The
-payload is copied to a remote temp path and executed as `bash "$T" <args>` (see
-`wrap_exec_file_script`); the exit code passes through and the temp file is
-removed either way. So a `.py` payload is read line by line as shell — remote
-stderr fills with `import: command not found` and nothing gets written. Ship a
-bash wrapper when the payload is another language:
 
 ```bash
 rsh worker-a -f ./run.sh -- a b     # ✅ run.sh is bash; it can embed a heredoc:
@@ -151,22 +130,12 @@ rsh worker-a -f ./run.sh -- a b     # ✅ run.sh is bash; it can embed a heredoc
 rsh worker-a -f ./tool.py -- a b    # ❌ executed by bash, not by python
 ```
 
-**Every route runs with the same cwd**: the rshd route inherits the worker's
-startup directory, the ssh routes prefix `cd <RSH_REMOTE_WS> && `, so callers can
-use workspace-relative paths on either route.
 
-Output is streamed back (≤64KB chunks, stdout/stderr kept apart) and the remote
-exit code is passed through. Exit codes: remote code as-is · **124** timeout ·
-**125** local error (hub not running, worker not registered, unreadable file,
-oversized payload) · **2** usage · **255** ssh's own failure (host unreachable /
-unknown) on a direct route.
+Modes follow flags: there are no list/exec subcommands (usage error, exit 2). Commands follow --. Each argv word is shlex-quoted, so composite commands need bash -lc; an unwrapped quoted command string is treated as a command name and exits 127, an assembly error rather than a channel fault.
 
-**Timeout semantics differ between routes.** The rshd route kills the remote
-process group (`killpg`), so the remote is definitely cleaned up. The ssh route
-can only kill the local ssh process: with `BatchMode` and no tty, sshd does not
-send SIGHUP, so **the remote job may keep running**. If you need "timeout always
-cleans the remote", use the rshd route (add the target to `RSH_NAT_HOSTS`) or
-carry your own timeout in the remote command (`timeout <N> <cmd>`).
+-f always runs bash, regardless of shebang; use a bash wrapper for Python. The reverse route inherits worker startup cwd; ssh routes cd to RSH_REMOTE_WS. Output streams in ≤64KB chunks with separate stdout/stderr. Exits: remote code, 124 timeout, 125 local/channel/file/payload error, 2 usage, 255 ssh failure.
+
+On timeout the reverse route kills the remote process group. Direct ssh kills only local ssh, and the remote job may continue without SIGHUP; require the reverse route or an explicit remote timeout when cleanup is mandatory.
 
 ## Shipping a script (`-f`)
 
@@ -183,105 +152,37 @@ the script from stdin (that is how the hub-nested route ships it).
 - **rshd route**: the CLI wraps it in base64 (transparent to the caller; the
   hub/worker protocol is unchanged): remote `mktemp /tmp/rsh-ef-XXXXXX` → decode
   → `bash` → delete, with `trap … EXIT INT TERM` so a timeout `killpg` still
-  cleans up. **Payload cap 10MB** (over it: exit 125) — for larger files use a
+  cleans up. Payload cap 10MB (over it: exit 125) — for larger files use a
   host you can ssh to directly.
 
 ## Port forwarding
 
-For every online worker named in `RSH_FWD_HOSTS` the hub listens on a unix
-socket `<fwd-dir>/<worker>.sock` (dir 0700, node 0600) and tunnels each inbound
-connection over the same long-lived channel to that worker's
-`127.0.0.1:<fwd-target>`. This is how a NAT'd machine's local HTTP service
-becomes reachable from the hub: point any unix-socket-capable proxy at the node.
-**The paths are not configurable per worker** — the hub derives them from the
-worker name (single source of truth), and consumers use the same convention.
+Online workers in RSH_FWD_HOSTS get <fwd-dir>/<worker>.sock (directory 0700, node 0600), tunnelling to worker 127.0.0.1:<fwd-target>. Paths derive from worker names; no per-worker overrides.
 
-Listener lifecycle follows registration: opened on register, closed (fd +
-`unlink` of the node) on disconnect or eviction; a same-name re-registration
-keeps the listener and re-points it at the new connection, dropping the old
-connection's in-flight tunnels (the new one cannot know their fids); at startup
-the hub creates the directory and sweeps leftover `*.sock` from a previous
-generation.
+Registration opens the listener, disconnect/eviction closes and unlinks it. Same-name registration retargets the listener and drops old in-flight tunnels. Startup sweeps leftover *.sock. Listeners must remain unix sockets: unlink-before-bind avoids the unreclaimable TCP LISTEN/EADDRINUSE failure that SO_REUSEADDR and administrative close cannot fix.
 
-**The inbound listener must stay a unix socket, never a TCP port.** With a unix
-socket, "occupied" *is* the filesystem node, so `bind()` can `unlink` any
-leftover first and cannot fail with `EADDRINUSE`. In TCP form, frequent
-bind→close→rebind makes the kernel occasionally keep a closed `LISTEN` socket
-unreclaimed; `SO_REUSEADDR` does not help on an active `LISTEN` and killing the
-socket administratively is refused — the only remedy is rebooting the hub. That
-failure recurred often enough to become a design invariant.
+Bind/configuration errors log ERROR and degrade only that worker to command mode; its next registration retries. Forward failures never stop command execution.
 
-A bind failure (directory permissions, path too long, filesystem error =
-configuration class) is logged as `ERROR` and degrades that worker to pure
-command mode; its **next registration** retries. **A forwarding problem never
-touches the command channel** — every forward path is fail-soft.
-
-Tunnel messages: `fwd_open{id,port}` (hub→worker, dial request) / `fwd_ack{id}` /
-`fwd_data{id,data}` (base64, ≤64KB raw per chunk, both directions) /
-`fwd_close{id}` (either side; a close or error propagates). Data arriving before
-the worker's upstream dial completes is buffered, capped at 4MB.
+Messages: fwd_open{id,port}, fwd_ack{id}, fwd_data{id,data} (base64, ≤64KB raw chunks, either direction), fwd_close{id}. Pre-dial data buffers up to 4MB; close/error propagates.
 
 ## Protocol (JSON-lines over one TCP connection)
 
-- **Register**: the worker's first line is
-  `{"type":"register","host":<name>,"token":…}`; the hub answers
-  `{"type":"registered"}` or closes immediately and logs `DENY`. **The hub sends
-  nothing before a valid registration**, so a port scan learns nothing. The token
-  is compared in constant time and a non-string token is rejected without
-  raising.
-- **Heartbeat**: hub `ping` every 30s, worker `pong`; the hub evicts after >90s
-  of silence, the worker self-heals (reconnect) after >100s; reconnect backoff is
-  exponential 1→60s.
-  **Eviction is usually a consequence of the peer being suspended, not a channel
-  fault**: while a laptop sleeps, the worker process is frozen, so the hub's
-  timer keeps running and the worker's does not. The `evicting` / `registered`
-  pair therefore shows up 1–2s after the peer wakes — check for that before
-  debugging the link. A `worker <name> disconnected` line can also lag the
-  eviction by tens of seconds (measured 34–90s, median ~58s): that is the kernel
-  giving up on the orphaned connection, not a second disconnect. A `disconnected`
-  within ~1s and with no `evicting` line means the peer closed deliberately.
-- **Exec**: `exec{id,cmd,timeout}` → `out`/`err` chunks → `result{id,exit}`;
-  `cancel{id}` kills the process group. Every exec is its own session and
-  process group (`start_new_session`) so a timeout or cancel can `killpg` the
-  whole tree, and the worker runs its own timer with the same timeout (missing/0
-  → 60s) so a lost cancel — or a dead hub — still terminates the job. One
-  connection carries many concurrent execs keyed by `id`; a duplicate `id`
-  reclaims ownership (the old process group is killed, and a generation check
-  keeps the superseded thread from popping the new entry or emitting a late
-  result).
-- **Line limit 1MB**: an authenticated connection that keeps sending an
-  unterminated oversized line is dropped rather than buffered without bound.
-- **CLI ↔ hub**: the unix control socket (0600, dir 0700) speaks
-  `{"op":"list"}` (reports each worker's `fwd_sock`, which is what the CLI's FWD
-  column shows; null when it has no forward) and
-  `{"op":"exec","worker":…,"cmd":[…],"timeout":N}`, streamed back as
-  `{"t":"out"/"err","data"}` then `{"t":"done","exit":N,"timeout":bool}` or
-  `{"t":"error","msg":…}`.
+- Registration starts with {type:register,host:<name>,token:…}; success returns {type:registered}, invalid tokens close with DENY. Nothing is sent before authentication; compare tokens in constant time and reject non-strings.
+- Hub ping every 30s, worker pong; hub evicts after >90s silence, worker reconnects after >100s, exponential backoff 1→60s. After suspend, eviction/registration usually appears 1–2s after wake. The old disconnected line may lag 34–90s (median~58s), a kernel teardown rather than a second disconnect; within~1s without evicting indicates deliberate close.
+- exec{id,cmd,timeout} → out/err → result{id,exit}; cancel{id} kills the process group. Each exec is a new session/group; the worker enforces its own timeout (missing/0→60s), including when cancel/hub is lost. Concurrent execs use ids; duplicate id kills the prior group, and generation checks reject its late result/removal.
+- Authenticated lines over 1MB without termination are dropped.
+- Local control socket (node 0600, directory 0700): {op:list} reports fwd_sock/null; {op:exec,worker:…,cmd:[…],timeout:N} returns {t:out/err,data}, then {t:done,exit:N,timeout:bool} or {t:error,msg:…}.
 
-Both daemons keep the reader socket **blocking** on purpose: a socket timeout
-would permanently poison the buffered reader, so a watchdog thread shuts the
-socket down on hub silence instead. An upstream socket is closed with `shutdown`
-before `close`, otherwise a thread blocked in `recv()` is never woken.
+Wire formats: `{"type":"register","host":<name>,"token":…}` · `{"type":"registered"}` · `{"op":"list"}` · `{"op":"exec","worker":…,"cmd":[…],"timeout":N}` · `{"t":"out"/"err","data"}` · `{"t":"done","exit":N,"timeout":bool}` · `{"t":"error","msg":…}`
+
+Reader sockets stay blocking; a watchdog shuts them down on hub silence. shutdown precedes close so blocked recv threads wake.
 
 ## Security and trust model
 
-- **The only authentication is the shared token.** Holding it is equivalent to
-  ssh trust across every online worker: anyone with it can run arbitrary
-  commands as that machine's local user. Use it between your own machines only,
-  and treat a leak as "all machines compromised" — rotate immediately (new
-  random token → update the config face on every machine → restart every hub and
-  worker).
-- **Minimal attack surface**: command execution plus hub-authorised port
-  forwarding, nothing else. `-f` file shipping is implemented entirely in the
-  CLI (ssh stdin / base64 wrapping) and adds no protocol face.
-- **The forward listeners are local unix sockets** (node 0600, dir 0700), so
-  access is governed by filesystem permissions: only the hub user (and root) can
-  connect. There is **no unauthenticated TCP port reachable from another
-  machine**; if you expose a forward further, put your own authentication in
-  front of it and remember that the upstream's own auth is the last line.
-- Binding `0.0.0.0:8790` on the hub is deliberate (workers must be able to reach
-  it from anywhere); the token is the only gate. The control face and the forward
-  face are both local 0600 unix sockets and grant nothing extra.
+- The shared token grants command execution as every online worker's local user. Use only trusted machines; a leak requires a new random token, configuration updates, and restart of every hub/worker.
+- Command execution and hub-authorised forwarding are the protocol surface. File shipping stays in the CLI and adds no protocol operation.
+- Control and forward unix sockets are 0600 in 0700 directories, accessible only to the hub user/root. Add authentication before exposing a forward; retain upstream authentication.
+- Hub 0.0.0.0:8790 accepts worker connections; the token is its sole authentication gate.
 
 ## Tests
 
