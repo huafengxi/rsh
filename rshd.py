@@ -278,13 +278,13 @@ class Hub(object):
             return
         while True:
             try:
-                conn, addr = srv.accept()   # AF_UNIX: addr is ''
+                conn, _ = srv.accept()
             except OSError:
                 return
-            threading.Thread(target=self.fwd_client, args=(host, conn, addr),
+            threading.Thread(target=self.fwd_client, args=(host, conn),
                              daemon=True).start()
 
-    def fwd_client(self, host, conn, addr):
+    def fwd_client(self, host, conn):
         """Hub side of one forwarded connection: allocate fid, ask the worker
         to dial the upstream, then pump client -> worker."""
         with self.fwd_lock:
@@ -296,9 +296,7 @@ class Hub(object):
                                   "port": self.fwd_target})
         except OSError as e:
             log("fwd %s: cannot notify worker %s (%s)" % (fid, host, e))
-            with self.fwd_lock:
-                self.fwd_conns.pop(fid, None)
-            close_quiet(conn)
+            self._fwd_drop_conn(fid, conn)
             return
         while True:
             try:
