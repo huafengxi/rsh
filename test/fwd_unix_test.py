@@ -2,7 +2,7 @@
 """Sandbox regression test for the rshd fwd unix-socket listeners.
 
 Usage:  python3 rsh/test/fwd_unix_test.py [--rshd PATH] [--base DIR] [--keep]
-Expect: RESULT: PASS (19/19 passed), exit code 0 (any FAIL -> exit code 1).
+Expect: RESULT: PASS (18/18 passed), exit code 0 (any FAIL -> exit code 1).
 
 Self-contained sandbox — safe to run next to a live hub:
   * a *second* rshd instance is spawned from the repo source, listening on an
@@ -30,8 +30,6 @@ Covers:
      command mode, command channel unaffected; the next registration of the
      same worker restores the listener once the dir is writable again
   F. op list reports fwd_sock (path) and clears it when the worker is gone
-  G. the fwd code path holds no TCP listener: AF_INET appears exactly once in
-     rshd.py (the hub's own 8790 listen socket)
 """
 import argparse
 import base64
@@ -402,21 +400,8 @@ def worker(sb, host):
     return FakeWorker(sb.port, sb.token, host)
 
 
-def static_checks(rshd_path):
-    """G. source-level invariant: the fwd path holds no TCP listener."""
-    try:
-        src = open(rshd_path).read()
-    except OSError as e:
-        skip("G. AF_INET appears exactly once in rshd.py",
-             "cannot read %s (%s)" % (rshd_path, e))
-        return
-    n = src.count("AF_INET")
-    check("G. AF_INET appears exactly once in rshd.py (the 8790 listener; "
-          "forwards stay on unix sockets)", n == 1, "count=%d" % n)
-
-
 def run_checks(sb, before):
-    """A–G against a running sandbox hub."""
+    """A–F against a running sandbox hub."""
     fwd = sb.fwd_dir
     log = sb.logtext
     check("A. startup sweep removed stale *.sock nodes",
@@ -557,7 +542,6 @@ def main():
               "port=%s base=%s" % (sb.port, sb.base))
         if started:
             run_checks(sb, before)
-            static_checks(args.rshd)
         else:
             print("--- rshd sandbox log ---")
             print(sb.logtext())

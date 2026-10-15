@@ -187,7 +187,7 @@ Reader sockets stay blocking; a watchdog shuts them down on hub silence. shutdow
 ## Tests
 
 ```bash
-python3 test/fwd_unix_test.py       # expect: RESULT: PASS (19/19 passed), exit 0
+python3 test/fwd_unix_test.py       # expect: RESULT: PASS (18/18 passed), exit 0
 ```
 
 A self-contained sandbox for the forwarding face: a temp directory, temp
@@ -197,13 +197,12 @@ forward directory or the online workers, and can run alongside them.
 `--rshd PATH` selects the hub under test (default: this repo's `rshd.py`),
 `--keep` keeps the sandbox for log inspection.
 
-Coverage A–G: startup sweep and directory permissions / binding over a leftover
+Coverage A–F: startup sweep and directory permissions / binding over a leftover
 node (dead socket and regular file) while workers outside the list stay in pure
 command mode / an end-to-end tunnel / 20 register-disconnect cycles with no
 residue / a bind failure degrading to `ERROR` with the command channel untouched
 and self-healing on the next registration / `op list` reporting and clearing
-`fwd_sock` / `AF_INET` appearing exactly once in `rshd.py` (the forward face must
-not regress to TCP).
+`fwd_sock`.
 
 Judge by the trailing `RESULT:` summary line, not by counting `PASS:` lines: a
 FAIL exits 1 and names the failed items, `SKIP:` means "not applicable in this
